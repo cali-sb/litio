@@ -33,6 +33,7 @@ SM_CXSMICON = 49
 IDLE = "general"  # Icono que lleva el menú cuando no hay ningún dispositivo que mostrar.
 LOW_FILL = (225, 40, 40, 255)
 LOW_TEXT = (255, 255, 255, 255)
+CHARGING_INK = (255, 216, 74, 255)  # El amarillo del rayo de la tecla del Stream Deck.
 
 log = logging.getLogger("battery-tray")
 lock = threading.Lock()
@@ -270,23 +271,27 @@ def device_colour(device):
         return None
 
 
-def tray_image(device, level, size, light, low_level):
+def tray_image(device, level, size, light, low_level, charging=False):
     """Icono de un dispositivo: su dibujo arriba y el número debajo.
 
+    Mientras carga, un rayo amarillo sustituye al dibujo, como en el Stream Deck.
     Con color fijo el color no avisa de nada, así que por debajo de `low_level`
     el número va sobre un fondo rojo.
     """
     fixed = device_colour(device) if device.get("color_mode") == "fixed" else None
     tinted = device_colour(device) if device.get("tint_glyph") else None
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    image.alpha_composite(glyph(device.get("kind", "other"), size, tinted or neutral_ink(light)))
+    if charging:
+        image.alpha_composite(brand.bolt_image(size // 2, CHARGING_INK), (size // 4, 0))
+    else:
+        image.alpha_composite(glyph(device.get("kind", "other"), size, tinted or neutral_ink(light)))
     draw = ImageDraw.Draw(image)
     text = "--" if level is None else str(level)
     points = round(size * 0.66)
     while draw.textlength(text, font=ImageFont.truetype("arialbd.ttf", points)) > size:
         points -= 1
     font = ImageFont.truetype("arialbd.ttf", points)
-    if fixed and level is not None and level < low_level:
+    if fixed and level is not None and level < low_level and not charging:
         draw.rounded_rectangle((0, size // 2, size - 1, size - 1), radius=size // 8, fill=LOW_FILL)
         fixed = LOW_TEXT
     draw.text((size / 2, size - (1 if fixed == LOW_TEXT else 0)), text, font=font, anchor="ms",
@@ -334,19 +339,20 @@ def line(status):
 
 
 def tray_loop(icon, key, size, light):
-    """Muestra el icono solo si el dispositivo está elegido y gastando batería."""
+    """Muestra el icono si el dispositivo está elegido y encendido, también mientras carga."""
     shown = None
     while not icon.closing.is_set():
         pairs, low_level = snapshot()
         active = frozenset(d["id"] for d, s in pairs
-                           if d.get("tray", True) and s["online"] and not s["charging"])
+                           if d.get("tray", True) and s["online"])
         mine = next(((d, s) for d, s in pairs if d["id"] == key), None)
         current = (active, low_level, json.dumps(mine, sort_keys=True, default=str) if mine else "",
                    tuple(line(s) + str(d.get("tray", True)) for d, s in pairs))
         if current != shown:
             shown = current
             if mine:
-                icon.icon = tray_image(mine[0], mine[1]["level"], size, light, low_level)
+                icon.icon = tray_image(mine[0], mine[1]["level"], size, light, low_level,
+                                       mine[1]["charging"] and mine[1]["online"])
                 icon.title = line(mine[1])[:127]
             icon.update_menu()
             icon.visible = key in active or (key == IDLE and not active)
