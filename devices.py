@@ -22,6 +22,8 @@ SONY_VID, SONY_PIDS = 0x054C, (0x0CE6, 0x0DF2)
 LOGI_VID = 0x046D
 LOGI_RECEIVERS = {0xC54D: True}  # PID: probado. Se añaden con `False` hasta poder probarlos.
 LOGI_RECEIVERS.update({pid: False for pid in (0xC539, 0xC53A, 0xC53D, 0xC53F, 0xC541, 0xC545, 0xC547)})
+# Ratones enchufados por cable para cargar: el receptor deja de verlos y salen con su propio PID.
+LOGI_WIRED = {0xC09B: True}  # PRO X 2. PID: probado.
 PERIPHERAL = re.compile(r"wireless|headset|headphone|mouse|keyboard|gamepad|controller|2\.4\s*ghz"
                         r"|receiver|dongle", re.I)
 KIND_WORDS = (("headset", r"head|buds|casco|auric|arctis|airpods|\bwh-|\bwf-"),
@@ -125,6 +127,8 @@ class LogitechReader:
     """HID++ 2.0 por un receptor LIGHTSPEED: Unified Battery, o Battery Status en modelos antiguos.
 
     Solo contesta mientras el ratón se usa; por eso exige actividad en el PC.
+    Enchufado por cable para cargar, el receptor deja de verlo: se le pregunta
+    directamente por el cable (índice 0xFF), y ahí contesta siempre.
     """
 
     interval, retry = 10, 5
@@ -132,13 +136,15 @@ class LogitechReader:
     # Si aun así se pierde alguna respuesta, no desaparece de la bandeja: solo
     # se da por apagado tras 2 minutos sin contestar.
     grace = 120
-    DEVICE = 1
+    RECEIVER, WIRED = 1, 0xFF  # Índice HID++ del ratón según la vía.
     FEATURES = ((0x1004, 1, 2), (0x1000, 0, 2))  # (función, consulta, byte de estado)
 
     def __init__(self, device=None):
         self.pid = int(device["ref"], 16) if device else None
         self.feature = None
         self.sw = 0
+        self.device = self.RECEIVER
+        self.via = None
 
     def _call(self, dev, idx, fn, params=b"", timeout=2.0):
         # Despierto contesta en menos de 10 ms; dormido, el receptor tarda en
@@ -147,7 +153,7 @@ class LogitechReader:
         # petición llegó a leerse como batería (7 % en vez de 57 %).
         self.sw = self.sw % 15 + 1
         expected = (fn << 4) | self.sw
-        dev.write((bytes([0x11, self.DEVICE, idx, expected]) + params).ljust(20, b"\0"))
+        dev.write((bytes([0x11, self.device, idx, expected]) + params).ljust(20, b"\0"))
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             raw = dev.read(20)
@@ -155,9 +161,9 @@ class LogitechReader:
                 time.sleep(0.003)
                 continue
             r = bytes(raw)
-            if r[1] == self.DEVICE and r[2] == 0xFF and r[3] == idx and r[4] == expected:
+            if r[1] == self.device and r[2] == 0xFF and r[3] == idx and r[4] == expected:
                 return None
-            if r[1] == self.DEVICE and r[2] == idx and r[3] == expected:
+            if r[1] == self.device and r[2] == idx and r[3] == expected:
                 return r[4:]
         return None
 
@@ -168,11 +174,21 @@ class LogitechReader:
                 return reply[0], query, status
         return None
 
-    def read(self):
-        path = next((d["path"] for d in hid.enumerate(LOGI_VID, self.pid)
+    @staticmethod
+    def _path(pid):
+        return next((d["path"] for d in hid.enumerate(LOGI_VID, pid)
                      if d["usage_page"] == 0xFF00 and d["usage"] == 2), None)
+
+    def read(self):
+        path, via = self._path(self.pid), self.pid
+        if path is None:
+            path, via = next(((p, pid) for pid in LOGI_WIRED if (p := self._path(pid))), (None, None))
         if path is None:
             return None
+        if via != self.via:  # Ha cambiado de receptor a cable o al revés.
+            self.via, self.feature = via, None
+            self.device = self.RECEIVER if via == self.pid else self.WIRED
+            self.needs_activity = via == self.pid
         dev = hid.device()
         dev.open_path(path)
         try:
@@ -329,6 +345,7 @@ def find_usb(hid_devices):
             found.append(candidate("Ratón Logitech", "logitech", f"{pid:04X}", "mouse", safe_read(reader),
                                    "Muévelo para que conteste." if tested
                                    else "Receptor sin probar. Muévelo para que conteste."))
+    known.update((LOGI_VID, pid) for pid in LOGI_WIRED)  # Se leen como el ratón de su receptor.
     for ref, model in load_protocols().items():
         vid = int(model["vid"], 16)
         known.update((vid, int(pid, 16)) for pid in model["pids"])
